@@ -49,6 +49,7 @@ $cli = "$env:LOCALAPPDATA\wechat-cli\bin\wechat-cli.exe"
 ## 关键事实（排查时用）
 
 - 微信 4.x 进程名是 **`WeChatAppEx`**，不是 `WeChat` / `Weixin`（探测"微信是否在跑"别查错）。
+- 图片暂不可读：微信 4.x 图片是 WXGF 私有格式，解码待做，图片消息标 `not_read`（目前只读文字 / 视频路径）。
 - key **按账号、按机器**，一次性提取后缓存；清缓存 / 换机器必须重新登录微信提取，无法通用。
 - 官方 release 目前**只有 macOS（darwin-arm64）包**，Windows 二进制需自己编译（`scripts/build-wx-cli.ps1`）
   或由 skill 分发。

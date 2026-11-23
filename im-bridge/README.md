@@ -15,16 +15,14 @@ im-bridge/
 ├── README.md                    # 本文档
 ├── docs/contract.md             # 统一契约设计
 ├── scripts/
-│   ├── build-wx-cli.ps1         # 从源码编译 wechat-cli.exe + libWCDB.dll
-│   ├── demo_read.py             # 真实读取示例
-│   └── probe_raw_error.py       # 探测 wx-cli 原始报错（调试用）
+│   └── build-wx-cli.ps1         # 从源码编译 wechat-cli.exe + libWCDB.dll
 ├── src/im_bridge/
 │   ├── contract.py              # 契约 dataclass
 │   ├── cli.py                   # 命令行入口
 │   └── adapters/
 │       ├── base.py              # Adapter 接口
 │       └── wechat/adapter.py    # 微信适配器（调 wx-cli，映射到契约）
-└── tests/test_wechat_adapter.py # 单元测试（13 个）
+└── tests/test_wechat_adapter.py # 单元测试（20 个）
 ```
 
 ## 统一契约（IM 无关）
@@ -86,15 +84,31 @@ python -m im_bridge.cli read --chat <名字> --kind group `
 ## 信息披露（发布前必做）
 
 wx-cli（MIT）、WCDB（腾讯）、OpenSSL 等第三方组件的许可 + 署名 + 清单；所用二进制的版本与来源。
-详见 legacy 中 `docs/research/T2-C0-source-provenance.md` 关于 Windows 二进制来源的历史疑问。
+
+## 能力边界
+
+- 文字：✅ 可读。
+- 视频：✅ 返回本地路径。
+- 图片：❌ 暂不可读（微信 4.x 图片是 WXGF 私有格式，解码待做，见 feature/image-decode 分支），消息标 `not_read`。
+- 语音 / 文件 / 链接 / 转发：映射已预留。
+
+## 二进制分发
+
+打包好的 Windows 二进制 zip：`wechat-cli-windows-x64.zip`（9.66 MB，
+SHA256 `2de9cd3067b73d8f50fe548c963ceeb8a19ad32f7a3f19cb7c94a6ff6e5c194a`）。
+
+收件人两种方式：
+
+- 把 zip 放到可下载的 URL，跑 `setup.ps1 -DownloadUrl <url>`；
+- 或直接把 zip 发给对方，跑 `setup.ps1 -PackagePath <zip路径>`。
 
 ## 状态
 
 - [x] 统一契约 + 微信适配器 + CLI
-- [x] 单元测试 13/13
+- [x] 单元测试 20/20
 - [x] 真实最小闭环读取验收（群「❤鲁乔(一一）亲子分享群❤」上周记录）
 - [x] Windows 二进制从源码编译 + 验证
-- [x] setup.ps1 + SKILL.md
+- [x] setup.ps1 + SKILL.md + 二进制打包
 - [ ] 飞书适配器
 - [ ] 钉钉适配器
-- [ ] 媒体类型（图片/视频/语音/链接/嵌套转发）解析
+- [ ] 图片解码（微信 4.x WXGF 私有格式，见 feature/image-decode 分支）
