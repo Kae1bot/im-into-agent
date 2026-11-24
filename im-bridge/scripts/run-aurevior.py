@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sqlite3
 import sys
+from types import ModuleType
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "vendor"))
@@ -82,9 +83,25 @@ def checked_message_tables(coverage):
 
 
 def main():
+    import click
     from click.testing import CliRunner
-    from wechat_cli import keys
-    from wechat_cli.main import cli
+    from wechat_cli.commands.contacts import contacts
+    from wechat_cli.commands.history import history
+    from wechat_cli.core.context import AppContext
+    from wechat_cli.version import APP_VERSION
+
+    @click.group()
+    @click.version_option(version=APP_VERSION, prog_name="wechat-cli")
+    @click.option("--config", "config_path")
+    @click.pass_context
+    def cli(ctx, config_path):
+        try:
+            ctx.obj = AppContext(config_path)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise click.ClickException(str(error)) from error
+
+    cli.add_command(contacts)
+    cli.add_command(history)
 
     if sys.argv[1:] == ["--version"]:
         result = CliRunner().invoke(cli, ["--version"])
@@ -107,7 +124,9 @@ def main():
     def unavailable(*_args, **_kwargs):
         raise RuntimeError("aurevior_read_only_keys_unavailable")
 
+    keys = ModuleType("wechat_cli.keys")
     keys.extract_keys = unavailable
+    sys.modules[keys.__name__] = keys
     coverage = {}
     if sys.argv[3] == "history":
         from wechat_cli.core import messages

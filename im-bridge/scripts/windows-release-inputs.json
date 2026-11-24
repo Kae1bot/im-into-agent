@@ -1,0 +1,31 @@
+{
+  "source": {
+    "name": "aurevior-source.zip",
+    "revision": "b0e6afdafba3c7a5b2845e454bbc3f219dd4c08d",
+    "url": "https://codeload.github.com/AuRevior-ai/wechat-cli/zip/b0e6afdafba3c7a5b2845e454bbc3f219dd4c08d",
+    "sha256": "91439927ec45436e50756e9a1c13635594237cfa8818da7a916bba7113aba486"
+  },
+  "wheels": [
+    {
+      "name": "click-8.5.1-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/31/7d/164b7ffc8624fe9efb4221bf9af485d5c1e41b9ae118045d2b6dc5457d8b/click-8.5.1-py3-none-any.whl",
+      "sha256": "8bb5376d2006950386f8c6427613334a2acadc5f559cb80e638d00b4df957e37",
+      "module": "click",
+      "metadata": "click-8.5.1.dist-info"
+    },
+    {
+      "name": "pycryptodome-3.24.1-cp37-abi3-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/8c/b1/f4b32febb3a88f73744deb4b5c8187e5e5ed5a24fd4ee54d965ccbc569cf/pycryptodome-3.24.1-cp37-abi3-win_amd64.whl",
+      "sha256": "c00aa444033bac0379413728e92223c7e2f2b5b85fb3e9284fee19239b6ad8a4",
+      "module": "Crypto",
+      "metadata": "pycryptodome-3.24.1.dist-info"
+    },
+    {
+      "name": "zstandard-0.25.0-cp314-cp314-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/3a/43/241f9615bcf8ba8903b3f0432da069e857fc4fd1783bd26183db53c4804b/zstandard-0.25.0-cp314-cp314-win_amd64.whl",
+      "sha256": "c19bcdd826e95671065f8692b5a4aa95c52dc7a02a4c5a0cac46deb879a017a2",
+      "module": "zstandard",
+      "metadata": "zstandard-0.25.0.dist-info"
+    }
+  ]
+}
