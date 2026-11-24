@@ -4,7 +4,7 @@ $ErrorActionPreference = 'Stop'
 $runtime = Get-BridgeRuntime
 $arguments = @($args)
 if ($arguments.Count -gt 0 -and $arguments[0] -in ('read','resolve')) {
-    $arguments += @('--config', $runtime.Config)
+    $arguments += @('--config', (Get-BridgeConfigPath $runtime))
 }
 & $runtime.Python -I -B "$PSScriptRoot\scripts\run-bridge.py" @arguments
 exit $LASTEXITCODE

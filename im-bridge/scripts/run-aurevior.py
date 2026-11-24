@@ -20,6 +20,32 @@ def usable_media(data, account: Path):
                 media["bridge_verified_path"] = str(path)
 
 
+def check_config(config: Path):
+    if not config.is_file():
+        return None, "key_missing"
+    try:
+        payload = json.loads(config.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return None, "config_invalid"
+        db_dir = Path(payload["db_dir"])
+        if not db_dir.is_absolute() or not db_dir.is_dir():
+            return None, "source_unavailable"
+        key_file = (config.parent / payload.get("keys_file", "all_keys.json")).resolve()
+        if not key_file.is_relative_to(config.parent):
+            return None, "config_invalid"
+        if not key_file.is_file():
+            return None, "key_missing"
+        keys = json.loads(key_file.read_text(encoding="utf-8"))
+        if not isinstance(keys, dict):
+            return None, "config_invalid"
+        if not any(isinstance(entry, dict) and entry.get("enc_key")
+                   for name, entry in keys.items() if not name.startswith("_")):
+            return None, "key_missing"
+    except (KeyError, OSError, TypeError, ValueError):
+        return None, "config_invalid"
+    return db_dir, None
+
+
 def main():
     from click.testing import CliRunner
     from wechat_cli import keys
@@ -29,19 +55,19 @@ def main():
         result = CliRunner().invoke(cli, ["--version"])
         print(result.stdout.strip())
         return result.exit_code
+    if len(sys.argv) == 3 and sys.argv[1] == "--check-config":
+        _, error = check_config(Path(sys.argv[2]).resolve())
+        if error:
+            print(json.dumps({"ok": False, "error": {"code": error}}))
+            return 3 if error == "key_missing" else 2
+        print(json.dumps({"ok": True, "status": "config_validated", "live_read_verified": False}))
+        return 0
     if len(sys.argv) < 4 or sys.argv[1] != "--config" or sys.argv[3] not in ("contacts", "history"):
         return 2
     config = Path(sys.argv[2]).resolve()
-    try:
-        payload = json.loads(config.read_text(encoding="utf-8-sig"))
-        db_dir = Path(payload["db_dir"])
-        if not db_dir.is_absolute() or not db_dir.is_dir():
-            return 3
-        key_file = (config.parent / payload.get("keys_file", "all_keys.json")).resolve()
-        if not key_file.is_relative_to(config.parent) or not key_file.is_file():
-            return 3
-    except (KeyError, OSError, TypeError, ValueError):
-        return 3
+    db_dir, error = check_config(config)
+    if error:
+        return 3 if error == "key_missing" else 2
 
     def unavailable(*_args, **_kwargs):
         raise RuntimeError("aurevior_read_only_keys_unavailable")
