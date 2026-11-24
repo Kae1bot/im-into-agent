@@ -14,7 +14,7 @@ from typing import Literal
 #: 会话类型
 ConversationKind = Literal["direct", "group", "any"]
 
-#: 消息类型（现在只实现 text，其余预留，后续加类型 = 加解析器）
+#: 统一消息类型，各适配器通过 Message.status 表示内容可读性。
 MESSAGE_KINDS = (
     "text", "image", "video", "audio", "file", "link", "location",
     "sticker", "card", "quote", "forward", "system", "transfer",
@@ -30,9 +30,14 @@ Completeness = Literal["complete", "partial"]
 
 @dataclass(frozen=True)
 class ConversationSpec:
-    """用户指定的会话（自然语言）。"""
-    name: str
+    """用户指定的会话，由自然名称或已确认的稳定 ID 定位。"""
+    name: str | None = None
     kind: ConversationKind = "any"
+    id: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.name is None) == (self.id is None) or not (self.name or self.id or "").strip():
+            raise ValueError("请提供一个非空会话名称或稳定 ID")
 
 
 @dataclass(frozen=True)
@@ -47,7 +52,13 @@ class QuerySpec:
     """查询输入。"""
     conversation: ConversationSpec
     range: TimeRange
-    kinds: tuple[str, ...] = ("text",)
+    kinds: tuple[str, ...] | None = ("text",)  # None 表示所有类型。
+
+    def __post_init__(self) -> None:
+        if self.kinds is not None and (
+            not self.kinds or any(kind not in MESSAGE_KINDS for kind in self.kinds)
+        ):
+            raise ValueError("请提供至少一种有效消息类型，或使用所有类型")
 
 
 @dataclass(frozen=True)
@@ -91,3 +102,4 @@ class ReadResult:
     completeness: Completeness
     source: str                    # wechat_local_db / feishu_api / dingtalk_api
     limitations: tuple[str, ...] = ()
+    oldest_scanned_at: str | None = None  # 已确认页中最早的消息时间。

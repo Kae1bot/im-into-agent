@@ -1,317 +1,194 @@
-"""微信适配器：调用 wx-cli（本机 CLI），把输出映射到统一契约。
-
-底层 key 提取 / SQLCipher 解密由 wx-cli 完成，本适配器不实现。
-它只做两件事：
-  1. QuerySpec → wx-cli 的 resolve_chat / chat_timeline 工具；
-  2. wx-cli 输出 → Message / ReadResult。
-
-调用方式按 wx-cli v2.0.2 及其本机 wrapper 的已验证约定：
-  wechat-cli.exe --strict-read-only call-json <tool>  （JSON 参数走 stdin）
-并通过环境变量注入 config（含 db_root + key）、WCDB 库、state 目录。
-"""
+"""Read one authorized conversation through AuRevior's public CLI."""
 from __future__ import annotations
 
-import json
-import os
-import subprocess
 from datetime import datetime, timezone
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
 from typing import Any
 
-from ...contract import (
-    Candidate,
-    Message,
-    QuerySpec,
-    ReadResult,
-    ResolveResult,
-    Sender,
-)
+from ...contract import Candidate, Message, QuerySpec, ReadResult, ResolveResult, Sender
 from ..base import Adapter
-from .image import derive_image_key_from_config
+
+_HISTORY_LIMIT = 10_000
+_MATCH_LIMIT = 500
+_KIND_ALIASES = {"voice": "audio", "forwarded": "forward"}
+_TEXT_KINDS = {"text", "system", "location", "link", "quote", "card"}
+_PATH_FIELDS = {"image": "images", "video": "videos", "file": "files"}
+_STABLE_ID = re.compile(r"^[A-Za-z0-9_.@-]{1,128}$")
 
 
 class WechatAdapterError(Exception):
-    """wx-cli 调用失败。"""
+    """A failure from the authorized read."""
 
 
 class WechatKeyMissingError(WechatAdapterError):
-    """key 未缓存（strict-read-only 模式下无法自动提取）。"""
+    """No provisioned local configuration is available."""
 
 
 class WechatResolveError(Exception):
-    """会话解析未唯一命中，携带 ResolveResult 供用户消歧。"""
-
     def __init__(self, result: ResolveResult):
         super().__init__(f"resolve_{result.status}")
         self.result = result
 
 
-# 契约会话类型 → wx-cli type_filter 值
-_KIND_TO_TYPE_FILTER = {"direct": "private", "group": "group", "any": ""}
-
-# wx-cli kind_name → 契约 kind
-_KIND_MAP = {
-    "text": "text",
-    "image": "image",
-    "video": "video",
-    "voice": "audio",
-    "file": "file",
-    "link": "link",
-    "location": "location",
-    "sticker": "sticker",
-    "card": "card",
-    "quote": "quote",
-    "forward_chat": "forward",
-    "system": "system",
-    "transfer": "transfer",
-    "red_packet": "red_packet",
-    "miniprogram": "miniprogram",
-}
+def _parse_time(value: str) -> datetime:
+    result = datetime.fromisoformat(value)
+    if result.utcoffset() is None:
+        raise WechatAdapterError("起止时间必须包含时区")
+    return result
 
 
-def iso_to_unix(iso: str) -> int:
-    """ISO 8601 → unix 秒（wx-cli after/before 接受 unix 秒或 YYYY-MM-DD）。"""
-    dt = datetime.fromisoformat(iso)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp())
+def _local_time(timestamp: int) -> str:
+    local = datetime.fromtimestamp(timestamp)
+    if datetime(*local.timetuple()[:6]).timestamp() != timestamp:
+        raise WechatAdapterError("此时段的本地时钟时间存在歧义")
+    return local.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _candidate_kind(username: str) -> str:
+    return "group" if username.endswith("@chatroom") else "direct"
+
+
+def _contact_names(contact: dict) -> tuple[str, ...]:
+    return tuple(value for key in ("remark", "nick_name", "alias", "username")
+                 if isinstance(value := contact.get(key), str) and value)
 
 
 class WechatAdapter(Adapter):
     source = "wechat_local_db"
 
-    def __init__(
-        self,
-        cli: str,
-        *,
-        config: str | None = None,
-        state_dir: str | None = None,
-        wcdb_lib: str | None = None,
-        strict_read_only: bool = False,
-        page_size: int = 200,
-    ):
-        self.cli = cli
-        self.config = config
-        self.state_dir = state_dir
-        self.wcdb_lib = wcdb_lib
-        self.strict_read_only = strict_read_only
-        self.page_size = page_size
+    def __init__(self, config: str | None = None):
+        default = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "IM-into-Agent-AuRevior/config.json"
+        self.config = Path(config).expanduser().resolve() if config else default
 
-    # ---- wx-cli 调用 ----
-
-    def _build_env(self) -> dict[str, str]:
-        # 清掉继承的 wx-cli 环境变量，再注入本适配器的运行时配置。
-        env = {
-            k: v for k, v in os.environ.items()
-            if not k.upper().startswith(("WECHAT_CLI_", "WX_MCP_"))
-        }
-        if self.config:
-            env["WECHAT_CLI_CONFIG"] = self.config
-            # 自动推导图片 key（md5(code+wxid)），避免独立 wxkey 进程/手动输入。
-            image_key = derive_image_key_from_config(self.config)
-            if image_key:
-                env["WECHAT_CLI_IMAGE_KEY"] = image_key
-        if self.state_dir:
-            env["WECHAT_CLI_STATE_DIR"] = self.state_dir
-        if self.wcdb_lib:
-            env["WECHAT_CLI_WCDB_LIB"] = self.wcdb_lib
-        env["WECHAT_CLI_STRICT_READ_ONLY"] = "1" if self.strict_read_only else "0"
-        return env
-
-    def _run(self, tool: str, params: dict[str, Any]) -> dict[str, Any]:
-        cmd = [self.cli]
-        if self.strict_read_only:
-            cmd.append("--strict-read-only")
-        cmd += ["call-json", tool]
+    def _run(self, args: list[str], scratch: Path) -> Any:
+        if not self.config.is_file():
+            raise WechatKeyMissingError("缺少独立的 AuRevior 只读配置")
+        package = Path(__file__).resolve().parents[4]
+        runner = package / "scripts" / "run-aurevior.py"
+        env = {key: value for key, value in os.environ.items()
+               if not key.upper().startswith(("WECHAT_CLI_", "WX_MCP_"))}
+        env.update(TEMP=str(scratch), TMP=str(scratch), USERPROFILE=str(scratch), HOME=str(scratch))
         try:
-            proc = subprocess.run(
-                cmd,
-                input=json.dumps(params, ensure_ascii=False),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                env=self._build_env(),
+            process = subprocess.run(
+                [sys.executable, "-I", "-B", str(runner), "--config", str(self.config), *args],
+                cwd=scratch, env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                encoding="utf-8", timeout=120,
             )
-        except OSError as exc:
-            raise WechatAdapterError(f"无法调用 wx-cli（{self.cli}）：{exc}") from exc
-
-        # wx-cli 失败时 returncode=1，但 JSON 错误在 stdout（stderr 通常为空），
-        # 所以先解析 stdout，再判断 ok；只有 stdout 不是 JSON 才退回 stderr/退出码。
+        except (OSError, UnicodeError, subprocess.TimeoutExpired) as error:
+            raise WechatAdapterError("AuRevior 调用未完成") from error
+        if process.returncode == 3:
+            raise WechatKeyMissingError("AuRevior 缺少可用的只读配置或分片密钥")
+        if process.returncode:
+            raise WechatAdapterError(f"AuRevior {args[0]} 调用失败")
         try:
-            data = json.loads(proc.stdout)
-        except json.JSONDecodeError as exc:
-            raise WechatAdapterError(
-                proc.stderr.strip() or f"wx-cli 退出码 {proc.returncode}，输出非 JSON"
-            ) from exc
+            return json.loads(process.stdout)
+        except json.JSONDecodeError as error:
+            raise WechatAdapterError("AuRevior 输出格式无效") from error
 
-        if not data.get("ok"):
-            err = data.get("error") or {}
-            if "key config is missing" in (err.get("message") or ""):
-                raise WechatKeyMissingError(
-                    "微信加密 key 未缓存：请先登录微信并运行一次 "
-                    "`wechat-cli cache refresh --force` 提取 key，然后再重试"
-                )
-            raise WechatAdapterError(json.dumps(err, ensure_ascii=False))
-        return data
-
-    # ---- 适配器接口 ----
+    def _resolve(self, name: str, kind: str, scratch: Path) -> ResolveResult:
+        if not name.strip():
+            return ResolveResult("not_found")
+        rows = self._run(["contacts", "--query", name, "--limit", str(_MATCH_LIMIT)], scratch)
+        if not isinstance(rows, list) or len(rows) >= _MATCH_LIMIT:
+            raise WechatAdapterError("会话解析输出无效或已截断")
+        candidates: dict[str, Candidate] = {}
+        for contact in rows:
+            if not isinstance(contact, dict):
+                raise WechatAdapterError("会话解析输出无效")
+            username = contact.get("username")
+            if not isinstance(username, str) or not _STABLE_ID.fullmatch(username):
+                continue
+            names = _contact_names(contact)
+            candidate_kind = _candidate_kind(username)
+            if name.casefold() not in {value.casefold() for value in names}:
+                continue
+            if kind != "any" and candidate_kind != kind:
+                continue
+            candidates[username] = Candidate(username, names[0], candidate_kind)
+        choices = tuple(candidates.values())
+        return ResolveResult("not_found" if not choices else "unique" if len(choices) == 1 else "ambiguous", choices)
 
     def resolve(self, name: str, kind: str = "any") -> ResolveResult:
-        params: dict[str, Any] = {"query": name}
-        type_filter = _KIND_TO_TYPE_FILTER.get(kind)
-        if type_filter:
-            params["type_filter"] = type_filter
-        data = self._run("resolve-chat", params)
-        raw = data.get("data", {}).get("candidates", [])
-        candidates = tuple(_map_candidate(c) for c in raw)
-        if not candidates:
-            return ResolveResult(status="not_found")
-        if len(candidates) > 1:
-            return ResolveResult(status="ambiguous", candidates=candidates)
-        return ResolveResult(status="unique", candidates=candidates)
+        with tempfile.TemporaryDirectory(prefix="im-bridge-aurevior-") as directory:
+            return self._resolve(name, kind, Path(directory))
 
     def read(self, query: QuerySpec) -> ReadResult:
-        resolved = self.resolve(query.conversation.name, query.conversation.kind)
-        if resolved.status != "unique":
-            raise WechatResolveError(resolved)
-        talker = resolved.candidates[0].id
-
-        since = str(iso_to_unix(query.range.since))
-        until = str(iso_to_unix(query.range.until))
-
-        # 单个游标循环读完整个时间范围（不是 legacy 的窗口切片/两趟读取）。
+        since, until = _parse_time(query.range.since), _parse_time(query.range.until)
+        if since >= until:
+            raise WechatAdapterError("起始时间必须早于结束时间")
+        first_second, end_second = math.ceil(since.timestamp()), math.ceil(until.timestamp()) - 1
+        limitations = ["non_snapshot", "remote_history_may_be_missing", "aurevior_no_shard_coverage"]
+        with tempfile.TemporaryDirectory(prefix="im-bridge-aurevior-") as directory:
+            scratch = Path(directory)
+            identity = query.conversation.id or query.conversation.name
+            resolved = self._resolve(identity, query.conversation.kind, scratch)
+            if resolved.status != "unique":
+                raise WechatResolveError(resolved)
+            candidate = resolved.candidates[0]
+            if query.conversation.id and candidate.id != query.conversation.id:
+                raise WechatResolveError(ResolveResult("not_found"))
+            if first_second > end_second:
+                return ReadResult((), "complete", self.source, tuple(limitations))
+            args = ["history", "--start-time", _local_time(first_second),
+                    "--end-time", _local_time(end_second), "--limit", str(_HISTORY_LIMIT + 1)]
+            if query.kinds != ("text",):
+                args.append("--media")
+            data = self._run([*args, "--", candidate.id], scratch)
+        if not isinstance(data, dict) or data.get("username") != candidate.id:
+            raise WechatAdapterError("AuRevior 返回的会话与授权不匹配")
+        rows = data.get("message_items")
+        if not isinstance(rows, list) or data.get("count") != len(rows) or len(rows) > _HISTORY_LIMIT + 1:
+            raise WechatAdapterError("AuRevior 返回的记录数量无效")
+        if data.get("failures"):
+            limitations.append("aurevior_read_failures")
+        if len(rows) > _HISTORY_LIMIT:
+            limitations.append("aurevior_result_limit")
         messages: list[Message] = []
-        cursor: str | None = None
-        limitations = ["non_snapshot"]
-        incomplete = False
-        while True:
-            params: dict[str, Any] = {
-                "talker": talker,
-                "limit": self.page_size,
-                "order": "desc",
-                "display_order": "asc",
-                "after": since,
-                "before": until,
-                "include_media_paths": True,
-                "include_debug": False,
-            }
-            if cursor:
-                params["before_message_token"] = cursor
-            data = self._run("timeline", params)
-            body = data.get("data", data)
-            messages.extend(_map_message(m) for m in body.get("messages", []))
-
-            query_meta = body.get("query") or {}
-            if not query_meta.get("has_more"):
-                break
-            cursor = (query_meta.get("cursor") or {}).get("next_before_message_token")
-            if not cursor:
-                # has_more 但没有游标：无法续读，如实标 partial。
-                incomplete = True
-                limitations.append("more_messages_unreachable_no_cursor")
-                break
-
-        messages.sort(key=lambda m: m.sent_at)
-        return ReadResult(
-            messages=tuple(messages),
-            completeness="partial" if incomplete else "complete",
-            source=self.source,
-            limitations=tuple(limitations),
-        )
+        timestamps: list[str] = []
+        for row in rows[-_HISTORY_LIMIT:]:
+            if not isinstance(row, dict) or row.get("chat_username") != candidate.id:
+                raise WechatAdapterError("AuRevior 返回了其他会话的记录")
+            stamp = row.get("timestamp")
+            if type(stamp) is not int or not first_second <= stamp <= end_second:
+                raise WechatAdapterError("AuRevior 返回了授权时段以外的记录")
+            sent_at = datetime.fromtimestamp(stamp, tz=timezone.utc).isoformat()
+            timestamps.append(sent_at)
+            kind = _KIND_ALIASES.get(row.get("type"), row.get("type"))
+            if kind not in ("audio", "forward", "sticker", "transfer", "red_packet", "miniprogram",
+                            *_TEXT_KINDS, *_PATH_FIELDS):
+                kind = "unknown"
+            if query.kinds is None or kind in query.kinds:
+                messages.append(_message(row, candidate.id, kind, sent_at))
+        return ReadResult(tuple(sorted(messages, key=lambda m: m.sent_at)), "partial", self.source,
+                          tuple(limitations), min(timestamps) if timestamps else None)
 
 
-# ---- 输出映射（纯函数，便于用 fixture 单测） ----
-
-def _map_chat_type(chat_type: Any) -> str:
-    return "group" if chat_type == "group" else "direct"
-
-
-def _map_kind(kind: Any) -> str:
-    return _KIND_MAP.get(kind, "unknown")
-
-
-def _map_candidate(raw: dict[str, Any]) -> Candidate:
-    username = raw.get("username") or ""
-    return Candidate(
-        id=username,
-        display=raw.get("display_name") or username,
-        kind=_map_chat_type(raw.get("chat_type")),
-    )
-
-
-# 契约已结构化支持的 kind（其余如 transfer/red_packet/sticker 暂标 unsupported）
-_SUPPORTED_KINDS = frozenset(
-    {"text", "image", "video", "audio", "file", "link", "forward", "quote"}
-)
-
-
-def _paths(items: Any) -> list[str] | None:
-    """从 wx-cli 的 images/videos/files 列表提取可直接读取的本地 path。"""
-    if not isinstance(items, list):
-        return None
-    out = [it["path"] for it in items if isinstance(it, dict) and it.get("path")]
-    return out or None
-
-
-def _extract_content(raw: dict[str, Any], kind: str) -> dict | None:
-    """按 kind 从 wx-cli 消息行提取契约 content（path/转写/链接/转发等）。"""
-    if kind == "text":
-        return {"text": raw.get("text")}
-    if kind == "image":
-        p = _paths(raw.get("images"))
-        return {"images": p} if p else None
-    if kind == "video":
-        p = _paths(raw.get("videos"))
-        return {"videos": p} if p else None
-    if kind == "file":
-        p = _paths(raw.get("files"))
-        return {"files": p} if p else None
-    if kind == "audio":
-        # 语音：优先转写文本（wx-cli 已本地转写），未转写则为 None
-        voice = raw.get("voice")
-        transcript = voice.get("transcript") if isinstance(voice, dict) else None
-        return {"transcript": transcript} if transcript else None
-    if kind == "link":
-        link = raw.get("link")
-        if not isinstance(link, dict):
-            return None
-        return {"title": link.get("title"), "url": link.get("url")}
-    if kind == "forward":
-        fw = raw.get("forward_chat")
-        if not isinstance(fw, dict):
-            return None
-        return {"title": fw.get("title"), "items": fw.get("items")}
-    if kind == "quote":
-        q = raw.get("quote")
-        if not isinstance(q, dict):
-            return None
-        return {"text": q.get("text"), "sender": q.get("sender")}
-    return None
-
-
-def _map_message(raw: dict[str, Any]) -> Message:
-    rid = raw.get("id") or {}
-    ref = (
-        rid.get("message_token")
-        or str(rid.get("server_id_str") or rid.get("local_id") or "")
-    )
-    sender = Sender(
-        display=raw.get("sender_contact_display")
-        or raw.get("sender")
-        or raw.get("sender_wxid"),
-        id=raw.get("sender_wxid"),
-    )
-    kind = _map_kind(raw.get("kind"))
-    content = _extract_content(raw, kind)
-    if kind in _SUPPORTED_KINDS:
-        status = "ok" if content is not None else "not_read"
-    else:
+def _message(row: dict, chat: str, kind: str, sent_at: str) -> Message:
+    sender = Sender(row.get("sender"), row.get("sender_username"))
+    content = None
+    status = "not_read"
+    if kind in _TEXT_KINDS and isinstance(row.get("text"), str):
+        content = {"text": row["text"]}
+    elif kind == "forward" and isinstance(row.get("forwarded"), dict):
+        forward = row["forwarded"]
+        content = {key: forward[key] for key in ("title", "items", "truncated") if key in forward}
+    elif kind in _PATH_FIELDS:
+        media = row.get("media")
+        if isinstance(media, dict) and media.get("bridge_verified_path"):
+            path = media["bridge_verified_path"]
+            if Path(path).suffix.lower() != ".dat":
+                content = {_PATH_FIELDS[kind]: [path]}
+    elif kind not in (*_TEXT_KINDS, *_PATH_FIELDS, "audio", "sticker", "forward"):
         status = "unsupported"
-    return Message(
-        ref=ref,
-        conversation=rid.get("talker") or "",
-        sender=sender,
-        sent_at=raw.get("time_iso") or "",
-        kind=kind,
-        content=content,
-        status=status,
-    )
+    identity = json.dumps([chat, row.get("id"), row["timestamp"], row.get("sender_username"),
+                           row.get("type"), row.get("text")], ensure_ascii=False)
+    ref = "ar:" + hashlib.sha256(identity.encode()).hexdigest()
+    return Message(ref, chat, sender, sent_at, kind, content, "ok" if content is not None else status)
