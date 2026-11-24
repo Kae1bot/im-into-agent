@@ -1,6 +1,9 @@
 """Run only the read commands included in the AuRevior Skill."""
+from contextlib import closing
+import hashlib
 import json
 from pathlib import Path
+import sqlite3
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,6 +49,38 @@ def check_config(config: Path):
     return db_dir, None
 
 
+def checked_message_tables(coverage):
+    """Observe shard discovery failures that upstream otherwise discards."""
+    def find(username, message_db_keys, cache):
+        table = "Msg_" + hashlib.md5(username.encode(), usedforsecurity=False).hexdigest()
+        matches = []
+        coverage.update(checked=0, failures=0)
+        for key in message_db_keys:
+            try:
+                path = cache.get(key)
+                if not path:
+                    coverage["failures"] += 1
+                    continue
+                uri = Path(path).resolve().as_uri() + "?mode=ro"
+                with closing(sqlite3.connect(uri, uri=True)) as connection:
+                    found = connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+                    ).fetchone()
+                    if found:
+                        timestamp = connection.execute(
+                            f"SELECT MAX(create_time) FROM [{table}]"
+                        ).fetchone()[0] or 0
+                        matches.append({
+                            "db_path": path, "table_name": table, "max_create_time": timestamp,
+                        })
+                coverage["checked"] += 1
+            except (OSError, sqlite3.Error, ValueError):
+                coverage["failures"] += 1
+        return sorted(matches, key=lambda item: item["max_create_time"], reverse=True)
+
+    return find
+
+
 def main():
     from click.testing import CliRunner
     from wechat_cli import keys
@@ -73,12 +108,19 @@ def main():
         raise RuntimeError("aurevior_read_only_keys_unavailable")
 
     keys.extract_keys = unavailable
+    coverage = {}
+    if sys.argv[3] == "history":
+        from wechat_cli.core import messages
+
+        messages._find_msg_tables_for_user = checked_message_tables(coverage)
     result = CliRunner().invoke(cli, sys.argv[1:])
     if result.exit_code:
         return 3 if "aurevior_read_only_keys_unavailable" in result.stderr else 1
     try:
         data = json.loads(result.stdout)
         if sys.argv[3] == "history":
+            data["message_shards_complete"] = coverage.get("checked", 0) > 0 and coverage["failures"] == 0
+            data["message_shard_failures"] = coverage.get("failures", 0)
             usable_media(data, db_dir.resolve().parent)
     except (OSError, TypeError, ValueError):
         return 1

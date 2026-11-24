@@ -7,7 +7,7 @@ Windows x64 evaluation Skill. The Skill requires an installed Windows x64 Python
 - `setup.ps1` rechecks the selected configuration. `config_validated` verifies the required files and source directory. An authorized read is needed to verify database connectivity.
 - `bridge.ps1 read --chat <name> --since <time> --until <time>` accepts a half-open interval with explicit offsets.
 
-Queries use a single bounded history request to avoid offset shifts between calls. Results remain partial because the upstream interface provides no reliable shard coverage signal. An individual message is marked unread when its underlying media is unavailable. This implementation does not transcribe audio.
+Queries use a single bounded history request to avoid offset shifts between calls. Results are complete for the current local data when all discovered message shards could be checked and the requested interval was read without failure or truncation. Shard and query failures are reported separately from media availability. An individual message is marked unread when its underlying media is unavailable. This implementation does not transcribe audio.
 
 AuRevior decrypts the database shards touched by a read into a temporary directory. The bridge removes that directory at the end of each ordinary call. Abrupt process termination can leave it behind. This evaluation should be run with synthetic data unless the user expressly allows temporary whole-shard plaintext.
 

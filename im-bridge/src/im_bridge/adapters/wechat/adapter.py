@@ -125,7 +125,7 @@ class WechatAdapter(Adapter):
         if since >= until:
             raise WechatAdapterError("起始时间必须早于结束时间")
         first_second, end_second = math.ceil(since.timestamp()), math.ceil(until.timestamp()) - 1
-        limitations = ["non_snapshot", "remote_history_may_be_missing", "aurevior_no_shard_coverage"]
+        limitations = ["non_snapshot", "remote_history_may_be_missing"]
         with tempfile.TemporaryDirectory(prefix="im-bridge-aurevior-") as directory:
             scratch = Path(directory)
             identity = query.conversation.id or query.conversation.name
@@ -147,10 +147,14 @@ class WechatAdapter(Adapter):
         rows = data.get("message_items")
         if not isinstance(rows, list) or data.get("count") != len(rows) or len(rows) > _HISTORY_LIMIT + 1:
             raise WechatAdapterError("AuRevior 返回的记录数量无效")
+        issues = []
+        if data.get("message_shards_complete") is not True:
+            issues.append("aurevior_shard_read_failures" if data.get("message_shard_failures")
+                          else "aurevior_shard_coverage_unverified")
         if data.get("failures"):
-            limitations.append("aurevior_read_failures")
+            issues.append("aurevior_read_failures")
         if len(rows) > _HISTORY_LIMIT:
-            limitations.append("aurevior_result_limit")
+            issues.append("aurevior_result_limit")
         messages: list[Message] = []
         timestamps: list[str] = []
         for row in rows[-_HISTORY_LIMIT:]:
@@ -167,8 +171,9 @@ class WechatAdapter(Adapter):
                 kind = "unknown"
             if query.kinds is None or kind in query.kinds:
                 messages.append(_message(row, candidate.id, kind, sent_at))
-        return ReadResult(tuple(sorted(messages, key=lambda m: m.sent_at)), "partial", self.source,
-                          tuple(limitations), min(timestamps) if timestamps else None)
+        return ReadResult(tuple(sorted(messages, key=lambda m: m.sent_at)),
+                          "partial" if issues else "complete", self.source,
+                          tuple(limitations + issues), min(timestamps) if timestamps else None)
 
 
 def _message(row: dict, chat: str, kind: str, sent_at: str) -> Message:
