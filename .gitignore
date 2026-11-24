@@ -1,0 +1,21 @@
+# 构建产物（wechat-cli.exe / libWCDB.dll / ffmpeg 等）
+build/
+
+# 旧项目（重构前的代码，仅本地参考，不纳入 git）
+legacy/
+
+# 参考用的其他 skill（非本项目产物）
+wechat-cli-skill/
+
+# DSH ACL 恢复文件
+.dsh-acl-recovery/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
